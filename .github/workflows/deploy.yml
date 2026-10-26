@@ -1,0 +1,64 @@
+name: Deploy Ariba Realm MCP
+
+on:
+  push:
+    branches:
+      - main                          # Triggers on every push to main branch
+
+env:
+  REGISTRY:   ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/ariba-realm-mcp
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write                 # Needed to push image to ghcr.io
+
+    steps:
+      # ── 1. Checkout code ─────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Log in to GitHub Container Registry ───────────────────────────
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # Auto-provided by GitHub
+
+      # ── 3. Build and push Docker image ───────────────────────────────────
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      # ── 4. Set up kubectl with Kyma kubeconfig ───────────────────────────
+      - name: Set up kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_DATA }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      # ── 5. Roll out new image to Kyma ────────────────────────────────────
+      - name: Deploy to Kyma
+        run: |
+          kubectl set image deployment/ariba-realm-mcp \
+            ariba-realm-mcp=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --namespace=default
+
+          kubectl rollout status deployment/ariba-realm-mcp \
+            --namespace=default \
+            --timeout=120s
+
+      # ── 6. Confirm deployment ─────────────────────────────────────────────
+      - name: Verify health
+        run: |
+          echo "Deployment complete."
+          kubectl get pods -l app=ariba-realm-mcp -n default
