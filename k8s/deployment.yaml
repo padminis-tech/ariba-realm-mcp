@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ariba-realm-mcp
+  namespace: default
+  labels:
+    app: ariba-realm-mcp
+    version: "1.0.0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ariba-realm-mcp
+  template:
+    metadata:
+      labels:
+        app: ariba-realm-mcp
+    spec:
+      containers:
+        - name: ariba-realm-mcp
+          image: ghcr.io/padminis-tech/ariba-realm-mcp:latest
+          ports:
+            - containerPort: 3000
+              name: http
+
+          # Ariba credentials injected from Kubernetes secret
+          envFrom:
+            - secretRef:
+                name: ariba-credentials
+
+          env:
+            - name: PORT
+              value: "3000"
+
+          # Liveness probe — restarts pod if /health stops responding
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+
+          # Readiness probe — removes pod from load balancer until ready
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+
+---
+# ── Kubernetes Service (ClusterIP) ───────────────────────────────────────────
+# The Kyma API Rule (created via dashboard) routes external HTTPS to this service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ariba-realm-mcp
+  namespace: default
+  labels:
+    app: ariba-realm-mcp
+spec:
+  selector:
+    app: ariba-realm-mcp
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+  type: ClusterIP
