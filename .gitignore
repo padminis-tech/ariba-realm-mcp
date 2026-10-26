@@ -1,1 +1,7 @@
+node_modules/
+.env
+dist/
+
+# Never commit real credentials
+k8s/ariba-secret-filled.yaml
 
