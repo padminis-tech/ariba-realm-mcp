@@ -1,1 +1,26 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Ariba Realm MCP Server — Required Environment Variables
+#
+# For LOCAL dev: copy this to a .env file and fill in values.
+# In production (Kyma): inject via the ariba-credentials Kubernetes secret.
+# See k8s/ariba-secret-template.yaml for the Kyma version.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ARIBA_BASE_URL      = https://openapi.ariba.com
+
+# Token URL by region:
+#   US:     https://api.ariba.com/v2/oauth/token
+#   Europe: https://api-eu.ariba.com/v2/oauth/token
+#   UAE:    https://api.mn1.ariba.com/v2/oauth/token
+ARIBA_TOKEN_URL     = https://api.ariba.com/v2/oauth/token
+
+# From developer.ariba.com → Manage → Your Application
+ARIBA_CLIENT_ID     = <your-oauth-client-id>
+ARIBA_CLIENT_SECRET = <your-oauth-client-secret>
+ARIBA_API_KEY       = <your-application-key>
+
+# Realm name  (use -T suffix for test realm)
+ARIBA_REALM         = <yourcompany-T>
+
+PORT                = 3000
 
