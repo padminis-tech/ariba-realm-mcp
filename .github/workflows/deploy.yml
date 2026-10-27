@@ -3,7 +3,7 @@ name: Deploy Ariba Realm MCP
 on:
   push:
     branches:
-      - main                          # Triggers on every push to main branch
+      - main
 
 env:
   REGISTRY:   ghcr.io
@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write                 # Needed to push image to ghcr.io
+      packages: write
 
     steps:
       # ── 1. Checkout code ─────────────────────────────────────────────────
@@ -27,7 +27,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}   # Auto-provided by GitHub
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # ── 3. Build and push Docker image ───────────────────────────────────
       - name: Build and push image
@@ -40,42 +40,33 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
 
       # ── 4. Set up kubectl with Kyma kubeconfig ───────────────────────────
-      -- name: Set up kubectl
-  run: |
-    mkdir -p $HOME/.kube
+      - name: Set up kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          printf '%s' "${{ secrets.KUBECONFIG_DATA }}" > /tmp/kube_raw
+          FIRST_LINE=$(head -1 /tmp/kube_raw)
+          if echo "$FIRST_LINE" | grep -q "^apiVersion"; then
+            echo "[kubectl setup] Secret is raw YAML — using directly"
+            cp /tmp/kube_raw $HOME/.kube/config
+          else
+            echo "[kubectl setup] Secret appears base64-encoded — decoding"
+            base64 --decode /tmp/kube_raw | tr -d '\r' > $HOME/.kube/config
+          fi
+          chmod 600 $HOME/.kube/config
+          rm -f /tmp/kube_raw
+          kubectl config view --minify 2>&1 | head -5
 
-    # Write secret to temp file (avoids shell interpolation issues with multiline)
-    printf '%s' "${{ secrets.KUBECONFIG_DATA }}" > /tmp/kube_raw
-
-    # Auto-detect: raw YAML or base64?
-    FIRST_LINE=$(head -1 /tmp/kube_raw)
-    if echo "$FIRST_LINE" | grep -q "^apiVersion"; then
-      echo "[kubectl setup] Secret is raw YAML — using directly"
-      cp /tmp/kube_raw $HOME/.kube/config
-    else
-      echo "[kubectl setup] Secret appears base64-encoded — decoding"
-      base64 --decode /tmp/kube_raw | tr -d '\r' > $HOME/.kube/config
-    fi
-
-    chmod 600 $HOME/.kube/config
-    rm -f /tmp/kube_raw
-
-    # Validate config loaded correctly
-    kubectl config view --minify 2>&1 | head -5
-
-
-      # ── 5. Roll out new image to Kyma ────────────────────────────────────
+      # ── 5. Deploy to Kyma ────────────────────────────────────────────────
       - name: Deploy to Kyma
         run: |
           kubectl set image deployment/ariba-realm-mcp \
             ariba-realm-mcp=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
             --namespace=default
-
           kubectl rollout status deployment/ariba-realm-mcp \
             --namespace=default \
             --timeout=120s
 
-      # ── 6. Confirm deployment ─────────────────────────────────────────────
+      # ── 6. Verify ────────────────────────────────────────────────────────
       - name: Verify health
         run: |
           echo "Deployment complete."
