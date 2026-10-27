@@ -2,7 +2,9 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as http from "http";
+import { randomUUID } from "crypto";
 
+// ── Ariba config ──────────────────────────────────────────────────────────
 const ARIBA = {
   baseUrl:      process.env.ARIBA_BASE_URL      || "https://openapi.ariba.com",
   tokenUrl:     process.env.ARIBA_TOKEN_URL     || "https://api.ariba.com/v2/oauth/token",
@@ -17,6 +19,7 @@ console.log(ready
   : "[Ariba MCP] WARNING: credentials not set — set env vars before testing"
 );
 
+// ── Token cache ───────────────────────────────────────────────────────────
 let _token = "", _exp = 0;
 async function getToken() {
   if (_token && Date.now() < _exp - 60_000) return _token;
@@ -33,6 +36,7 @@ async function getToken() {
   return _token;
 }
 
+// ── Ariba GET helper ──────────────────────────────────────────────────────
 async function aribaGet(apiPath, extra = {}) {
   if (!ready) throw new Error("Ariba credentials not configured.");
   const token  = await getToken();
@@ -44,117 +48,179 @@ async function aribaGet(apiPath, extra = {}) {
   return r.json();
 }
 
-const server = new Server(
-  { name: "ariba-realm-mcp", version: "1.0.0" },
-  { capabilities: { tools: {} } }
-);
+// ── Parse request body ────────────────────────────────────────────────────
+function parseBody(req) {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", chunk => { data += chunk; });
+    req.on("end", () => {
+      try { resolve(JSON.parse(data)); }
+      catch { resolve(undefined); }
+    });
+  });
+}
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "get_requisitions",
-      description: "Fetch purchase requisitions from the SAP Ariba realm.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          status:      { type: "string", description: "Approved | Denied | Composing | Submitted | Ordering" },
-          requesterId: { type: "string", description: "Ariba user ID of the requester" },
-          top:         { type: "number", description: "Max records (default 20)" },
+// ── Create a new MCP Server instance (called per session) ─────────────────
+function createMcpServer() {
+  const server = new Server(
+    { name: "ariba-realm-mcp", version: "1.0.0" },
+    { capabilities: { tools: {} } }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: "get_requisitions",
+        description: "Fetch purchase requisitions from the SAP Ariba realm.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            status:      { type: "string", description: "Approved | Denied | Composing | Submitted | Ordering" },
+            requesterId: { type: "string", description: "Ariba user ID of the requester" },
+            top:         { type: "number", description: "Max records (default 20)" },
+          },
         },
       },
-    },
-    {
-      name: "get_purchase_orders",
-      description: "Fetch purchase orders from the SAP Ariba realm.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          status:       { type: "string", description: "Ordered | Received | Cancelled | Invoiced" },
-          supplierName: { type: "string", description: "Partial supplier name" },
-          top:          { type: "number", description: "Max records (default 20)" },
+      {
+        name: "get_purchase_orders",
+        description: "Fetch purchase orders from the SAP Ariba realm.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            status:       { type: "string", description: "Ordered | Received | Cancelled | Invoiced" },
+            supplierName: { type: "string", description: "Partial supplier name" },
+            top:          { type: "number", description: "Max records (default 20)" },
+          },
         },
       },
-    },
-    {
-      name: "get_invoices",
-      description: "Fetch invoices from the SAP Ariba realm.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          status: { type: "string", description: "Reconciled | Rejected | Paying | Paid | Approving" },
-          top:    { type: "number", description: "Max records (default 20)" },
+      {
+        name: "get_invoices",
+        description: "Fetch invoices from the SAP Ariba realm.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            status: { type: "string", description: "Reconciled | Rejected | Paying | Paid | Approving" },
+            top:    { type: "number", description: "Max records (default 20)" },
+          },
         },
       },
-    },
-  ],
-}));
+    ],
+  }));
 
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const { name, arguments: a } = req.params;
-  const top = Math.min(Number(a?.top || 20), 100).toString();
-  const f = (...parts) => parts.filter(Boolean).join(" and ") || undefined;
-  try {
-    if (name === "get_requisitions") {
-      const $filter = f(
-        a?.status      ? `Status eq '${a.status}'` : null,
-        a?.requesterId ? `RequesterUserId eq '${a.requesterId}'` : null
-      );
-      const data = await aribaGet(
-        "/api/procurement-reports/v2/prod/views/RequisitionLineItemFact",
-        { $top: top, ...($filter ? { $filter } : {}) }
-      );
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    const { name, arguments: a } = req.params;
+    const top = Math.min(Number(a?.top || 20), 100).toString();
+    const f = (...parts) => parts.filter(Boolean).join(" and ") || undefined;
+    try {
+      if (name === "get_requisitions") {
+        const $filter = f(
+          a?.status      ? `Status eq '${a.status}'` : null,
+          a?.requesterId ? `RequesterUserId eq '${a.requesterId}'` : null
+        );
+        const data = await aribaGet(
+          "/api/procurement-reports/v2/prod/views/RequisitionLineItemFact",
+          { $top: top, ...($filter ? { $filter } : {}) }
+        );
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+      if (name === "get_purchase_orders") {
+        const $filter = f(
+          a?.status       ? `Status eq '${a.status}'` : null,
+          a?.supplierName ? `contains(SupplierName,'${a.supplierName}')` : null
+        );
+        const data = await aribaGet(
+          "/api/procurement-reports/v2/prod/views/PurchaseOrderLineItemFact",
+          { $top: top, ...($filter ? { $filter } : {}) }
+        );
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+      if (name === "get_invoices") {
+        const $filter = f(a?.status ? `ReconciliationStatus eq '${a.status}'` : null);
+        const data = await aribaGet(
+          "/api/invoice-reconciliation-reports/v1/prod/views/InvoiceLineItemFact",
+          { $top: top, ...($filter ? { $filter } : {}) }
+        );
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+      throw new Error(`Unknown tool: ${name}`);
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
     }
-    if (name === "get_purchase_orders") {
-      const $filter = f(
-        a?.status       ? `Status eq '${a.status}'` : null,
-        a?.supplierName ? `contains(SupplierName,'${a.supplierName}')` : null
-      );
-      const data = await aribaGet(
-        "/api/procurement-reports/v2/prod/views/PurchaseOrderLineItemFact",
-        { $top: top, ...($filter ? { $filter } : {}) }
-      );
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-    if (name === "get_invoices") {
-      const $filter = f(a?.status ? `ReconciliationStatus eq '${a.status}'` : null);
-      const data = await aribaGet(
-        "/api/invoice-reconciliation-reports/v1/prod/views/InvoiceLineItemFact",
-        { $top: top, ...($filter ? { $filter } : {}) }
-      );
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-    throw new Error(`Unknown tool: ${name}`);
-  } catch (err) {
-    return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
-  }
-});
+  });
 
+  return server;
+}
+
+// ── Session store (one transport + server per JWD session) ────────────────
+const sessions = new Map();
+
+// ── HTTP server ───────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const httpServer = http.createServer();
-const transport  = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
-httpServer.on("request", (req, res) => {
+httpServer.on("request", async (req, res) => {
   console.log(`[REQUEST] ${req.method} ${req.url}`);
-  res.setHeader("Access-Control-Allow-Origin",  "*");
-res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-res.setHeader("Access-Control-Allow-Headers",
-  "Content-Type, Authorization, mcp-session-id, Mcp-Session-Id, Accept");
-res.setHeader("Access-Control-Expose-Headers",
-  "Mcp-Session-Id, mcp-session-id");
 
-// Log response status for diagnostics
-const origWriteHead = res.writeHead.bind(res);
-res.writeHead = (statusCode, ...args) => {
-  console.log(`[RESPONSE] ${req.method} ${req.url} → ${statusCode}`);
-  return origWriteHead(statusCode, ...args);
-};
+  // Response logging
+  const origWriteHead = res.writeHead.bind(res);
+  res.writeHead = (statusCode, ...args) => {
+    console.log(`[RESPONSE] ${req.method} ${req.url} → ${statusCode}`);
+    return origWriteHead(statusCode, ...args);
+  };
+
+  // CORS
+  res.setHeader("Access-Control-Allow-Origin",  "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers",
+    "Content-Type, Authorization, mcp-session-id, Mcp-Session-Id, Accept");
+  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id, mcp-session-id");
 
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
-  if      (req.url === "/mcp")    transport.handleRequest(req, res);
-  else if (req.url === "/health") { res.writeHead(200); res.end("OK"); }
-  else { res.writeHead(404); res.end("Not Found"); }
+  if (req.url === "/health")    { res.writeHead(200); res.end("OK"); return; }
+
+  if (req.url === "/mcp") {
+    // Parse body for POST
+    const body = req.method === "POST" ? await parseBody(req) : undefined;
+
+    const sessionId = req.headers["mcp-session-id"];
+    let transport   = sessions.get(sessionId);
+
+    if (!transport) {
+      // Only initialize requests can create a new session
+      const isInit = body?.method === "initialize";
+      if (!isInit) {
+        console.log(`[SESSION] Rejected — no session for: ${sessionId}`);
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "No active session. Send initialize first." }));
+        return;
+      }
+
+      // Create fresh transport + server for this session
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (id) => {
+          sessions.set(id, transport);
+          console.log(`[SESSION] Created: ${id}`);
+        },
+      });
+
+      transport.onclose = () => {
+        if (transport.sessionId) {
+          sessions.delete(transport.sessionId);
+          console.log(`[SESSION] Closed: ${transport.sessionId}`);
+        }
+      };
+
+      const server = createMcpServer();
+      await server.connect(transport);
+    }
+
+    await transport.handleRequest(req, res, body);
+    return;
+  }
+
+  res.writeHead(404);
+  res.end("Not Found");
 });
 
-server.connect(transport);
 httpServer.listen(PORT, () => console.log(`[Ariba MCP] Listening on :${PORT}/mcp`));
