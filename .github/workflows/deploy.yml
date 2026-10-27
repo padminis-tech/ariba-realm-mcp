@@ -40,11 +40,29 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
 
       # ── 4. Set up kubectl with Kyma kubeconfig ───────────────────────────
-      - name: Set up kubectl
-        run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBECONFIG_DATA }}" | base64 -d > $HOME/.kube/config
-          chmod 600 $HOME/.kube/config
+      -- name: Set up kubectl
+  run: |
+    mkdir -p $HOME/.kube
+
+    # Write secret to temp file (avoids shell interpolation issues with multiline)
+    printf '%s' "${{ secrets.KUBECONFIG_DATA }}" > /tmp/kube_raw
+
+    # Auto-detect: raw YAML or base64?
+    FIRST_LINE=$(head -1 /tmp/kube_raw)
+    if echo "$FIRST_LINE" | grep -q "^apiVersion"; then
+      echo "[kubectl setup] Secret is raw YAML — using directly"
+      cp /tmp/kube_raw $HOME/.kube/config
+    else
+      echo "[kubectl setup] Secret appears base64-encoded — decoding"
+      base64 --decode /tmp/kube_raw | tr -d '\r' > $HOME/.kube/config
+    fi
+
+    chmod 600 $HOME/.kube/config
+    rm -f /tmp/kube_raw
+
+    # Validate config loaded correctly
+    kubectl config view --minify 2>&1 | head -5
+
 
       # ── 5. Roll out new image to Kyma ────────────────────────────────────
       - name: Deploy to Kyma
