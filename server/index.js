@@ -13,8 +13,12 @@ const ARIBA = {
   realm:        process.env.ARIBA_REALM         || "",
 };
 const ready = !!(ARIBA.clientId && ARIBA.clientSecret && ARIBA.apiKey && ARIBA.realm);
+
+// Test realms end with -T → use sandbox; production realms → use prod
+const ENV = ARIBA.realm.endsWith("-T") ? "sandbox" : "prod";
+
 console.log(ready
-  ? `[Ariba MCP] Ready — realm: ${ARIBA.realm}`
+  ? `[Ariba MCP] Ready — realm: ${ARIBA.realm} | env: ${ENV}`
   : "[Ariba MCP] WARNING: credentials not set — set env vars before testing"
 );
 
@@ -117,7 +121,7 @@ function buildServer() {
           a?.requesterId ? `RequesterUserId eq '${a.requesterId}'` : null
         );
         const data = await aribaGet(
-          "/api/analytics-reporting-details/v2/prod/views/RequisitionLineItemFact",
+          `/api/analytics-reporting-details/v2/${ENV}/views/RequisitionLineItemFact`,
           { $top: top, ...($filter ? { $filter } : {}) }
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -128,7 +132,7 @@ function buildServer() {
           a?.supplierName ? `contains(SupplierName,'${a.supplierName}')` : null
         );
         const data = await aribaGet(
-          "/api/analytics-reporting-details/v2/prod/views/PurchaseOrderLineItemFact",
+          `/api/analytics-reporting-details/v2/${ENV}/views/PurchaseOrderLineItemFact`,
           { $top: top, ...($filter ? { $filter } : {}) }
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -136,7 +140,7 @@ function buildServer() {
       if (name === "get_invoices") {
         const $filter = f(a?.status ? `ReconciliationStatus eq '${a.status}'` : null);
         const data = await aribaGet(
-          "/api/analytics-reporting-details/v2/prod/views/InvoiceLineItemFact",
+          `/api/analytics-reporting-details/v2/${ENV}/views/InvoiceLineItemFact`,
           { $top: top, ...($filter ? { $filter } : {}) }
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -174,8 +178,6 @@ httpServer.on("request", async (req, res) => {
 
   if (req.url === "/mcp") {
     const body = req.method === "POST" ? await parseBody(req) : undefined;
-
-    // Fresh transport + server for every request — no session state to lose
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     const server    = buildServer();
     await server.connect(transport);
