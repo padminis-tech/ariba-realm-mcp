@@ -14,7 +14,7 @@ const ARIBA = {
 };
 const ready = !!(ARIBA.clientId && ARIBA.clientSecret && ARIBA.apiKey && ARIBA.realm);
 
-// Test realms end with -T → use sandbox; production realms → use prod
+// Test realms end with -T → sandbox; production realms → prod
 const ENV = ARIBA.realm.endsWith("-T") ? "sandbox" : "prod";
 
 console.log(ready
@@ -40,11 +40,13 @@ async function getToken() {
 }
 
 // ── Ariba GET helper ──────────────────────────────────────────────────────
-async function aribaGet(apiPath, extra = {}) {
+async function aribaGet(apiPath, queryParams = {}) {
   if (!ready) throw new Error("Ariba credentials not configured.");
   const token  = await getToken();
-  const params = new URLSearchParams({ realm: ARIBA.realm, ...extra });
-  const r = await fetch(`${ARIBA.baseUrl}${apiPath}?${params}`, {
+  const params = new URLSearchParams({ realm: ARIBA.realm, ...queryParams });
+  const url    = `${ARIBA.baseUrl}${apiPath}?${params}`;
+  console.log(`[Ariba] GET ${url}`);
+  const r = await fetch(url, {
     headers: { "Authorization": `Bearer ${token}`, "apiKey": ARIBA.apiKey, "Accept": "application/json" },
   });
   if (!r.ok) throw new Error(`Ariba API error (${r.status}): ${await r.text()}`);
@@ -63,7 +65,7 @@ function parseBody(req) {
   });
 }
 
-// ── Build MCP server with all tool handlers ───────────────────────────────
+// ── Build MCP server ──────────────────────────────────────────────────────
 function buildServer() {
   const server = new Server(
     { name: "ariba-realm-mcp", version: "1.0.0" },
@@ -113,38 +115,49 @@ function buildServer() {
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const { name, arguments: a } = req.params;
     const top = Math.min(Number(a?.top || 20), 100).toString();
-    const f = (...parts) => parts.filter(Boolean).join(" and ") || undefined;
+
     try {
+      // ── get_requisitions ──────────────────────────────────────────────
       if (name === "get_requisitions") {
-        const $filter = f(
-          a?.status      ? `Status eq '${a.status}'` : null,
-          a?.requesterId ? `RequesterUserId eq '${a.requesterId}'` : null
-        );
+        const filters = {};
+        if (a?.status)      filters.Status      = [a.status];
+        if (a?.requesterId) filters.RequesterId = [a.requesterId];
+        const params = { $top: top };
+        if (Object.keys(filters).length) params.filters = JSON.stringify(filters);
         const data = await aribaGet(
-          `/api/analytics-reporting-details/v2/${ENV}/views/RequisitionLineItemFact`,
-          { $top: top, ...($filter ? { $filter } : {}) }
+          `/api/procurement-reporting-details/v2/${ENV}/views/RequisitionLineItemFact`,
+          params
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
+
+      // ── get_purchase_orders ───────────────────────────────────────────
       if (name === "get_purchase_orders") {
-        const $filter = f(
-          a?.status       ? `Status eq '${a.status}'` : null,
-          a?.supplierName ? `contains(SupplierName,'${a.supplierName}')` : null
-        );
+        const filters = {};
+        if (a?.status)       filters.Status       = [a.status];
+        if (a?.supplierName) filters.SupplierName = [a.supplierName];
+        const params = { $top: top };
+        if (Object.keys(filters).length) params.filters = JSON.stringify(filters);
         const data = await aribaGet(
-          `/api/analytics-reporting-details/v2/${ENV}/views/PurchaseOrderLineItemFact`,
-          { $top: top, ...($filter ? { $filter } : {}) }
+          `/api/procurement-reporting-details/v2/${ENV}/views/PurchaseOrderLineItemFact`,
+          params
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
+
+      // ── get_invoices ──────────────────────────────────────────────────
       if (name === "get_invoices") {
-        const $filter = f(a?.status ? `ReconciliationStatus eq '${a.status}'` : null);
+        const filters = {};
+        if (a?.status) filters.Status = [a.status];
+        const params = { $top: top };
+        if (Object.keys(filters).length) params.filters = JSON.stringify(filters);
         const data = await aribaGet(
-          `/api/analytics-reporting-details/v2/${ENV}/views/InvoiceLineItemFact`,
-          { $top: top, ...($filter ? { $filter } : {}) }
+          `/api/procurement-reporting-details/v2/${ENV}/views/InvoiceLineItemFact`,
+          params
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
+
       throw new Error(`Unknown tool: ${name}`);
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
@@ -177,7 +190,7 @@ httpServer.on("request", async (req, res) => {
   if (req.url === "/health")    { res.writeHead(200); res.end("OK"); return; }
 
   if (req.url === "/mcp") {
-    const body = req.method === "POST" ? await parseBody(req) : undefined;
+    const body      = req.method === "POST" ? await parseBody(req) : undefined;
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     const server    = buildServer();
     await server.connect(transport);
