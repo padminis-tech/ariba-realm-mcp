@@ -137,8 +137,19 @@ const transport  = new StreamableHTTPServerTransport({ sessionIdGenerator: undef
 httpServer.on("request", (req, res) => {
   console.log(`[REQUEST] ${req.method} ${req.url}`);
   res.setHeader("Access-Control-Allow-Origin",  "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, mcp-session-id, Accept");
+res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+res.setHeader("Access-Control-Allow-Headers",
+  "Content-Type, Authorization, mcp-session-id, Mcp-Session-Id, Accept");
+res.setHeader("Access-Control-Expose-Headers",
+  "Mcp-Session-Id, mcp-session-id");
+
+// Log response status for diagnostics
+const origWriteHead = res.writeHead.bind(res);
+res.writeHead = (statusCode, ...args) => {
+  console.log(`[RESPONSE] ${req.method} ${req.url} → ${statusCode}`);
+  return origWriteHead(statusCode, ...args);
+};
+
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
   if      (req.url === "/mcp")    transport.handleRequest(req, res);
   else if (req.url === "/health") { res.writeHead(200); res.end("OK"); }
