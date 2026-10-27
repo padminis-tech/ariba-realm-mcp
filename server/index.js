@@ -117,7 +117,7 @@ function buildServer() {
           a?.requesterId ? `RequesterUserId eq '${a.requesterId}'` : null
         );
         const data = await aribaGet(
-          "/api/procurement-reports/v2/prod/views/RequisitionLineItemFact",
+          "/api/analytics-reporting-details/v2/prod/views/RequisitionLineItemFact",
           { $top: top, ...($filter ? { $filter } : {}) }
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -128,7 +128,7 @@ function buildServer() {
           a?.supplierName ? `contains(SupplierName,'${a.supplierName}')` : null
         );
         const data = await aribaGet(
-          "/api/procurement-reports/v2/prod/views/PurchaseOrderLineItemFact",
+          "/api/analytics-reporting-details/v2/prod/views/PurchaseOrderLineItemFact",
           { $top: top, ...($filter ? { $filter } : {}) }
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -136,7 +136,7 @@ function buildServer() {
       if (name === "get_invoices") {
         const $filter = f(a?.status ? `ReconciliationStatus eq '${a.status}'` : null);
         const data = await aribaGet(
-          "/api/invoice-reconciliation-reports/v1/prod/views/InvoiceLineItemFact",
+          "/api/analytics-reporting-details/v2/prod/views/InvoiceLineItemFact",
           { $top: top, ...($filter ? { $filter } : {}) }
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
