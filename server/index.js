@@ -140,10 +140,39 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 const PORT = process.env.PORT || 3000;
 const httpServer = http.createServer();
 const transport  = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+
 httpServer.on("request", (req, res) => {
+
+  // Log every incoming request so we can see what JWD sends
+  console.log(`[REQUEST] ${req.method} ${req.url}`);
+
+  // CORS headers for JWD (Electron renderer)
+  res.setHeader("Access-Control-Allow-Origin",  "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers",
+    "Content-Type, Authorization, mcp-session-id, Accept");
+
+  // Handle CORS preflight
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   if      (req.url === "/mcp")    transport.handleRequest(req, res);
   else if (req.url === "/health") { res.writeHead(200); res.end("OK"); }
-  else                            { res.writeHead(404); res.end("Not Found"); }
+  else {
+    console.log(`[404] ${req.method} ${req.url} — not handled`);
+    res.writeHead(404);
+    res.end("Not Found");
+  }
+});
+
+server.connect(transport);
+httpServer.listen(PORT, () =>
+  console.log(`[Ariba MCP] Listening on :${PORT}/mcp`)
+);
+
 });
 server.connect(transport);
 httpServer.listen(PORT, () => console.log(`[Ariba MCP] Listening on :${PORT}/mcp`));
