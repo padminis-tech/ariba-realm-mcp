@@ -10,18 +10,17 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/ariba-realm-mcp
 
 jobs:
-  build-and-deploy:
+  # ── Job 1: Build and push Docker image ──────────────────────────────────────
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      # ── 1. Checkout code ─────────────────────────────────────────────────
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── 2. Log in to GitHub Container Registry ───────────────────────────
       - name: Log in to ghcr.io
         uses: docker/login-action@v3
         with:
@@ -29,7 +28,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 3. Build and push Docker image ───────────────────────────────────
       - name: Build and push image
         uses: docker/build-push-action@v5
         with:
@@ -37,37 +35,35 @@ jobs:
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
 
-      # ── 4. Set up kubectl with Kyma kubeconfig ───────────────────────────
-      - name: Set up kubectl
-        run: |
-          mkdir -p $HOME/.kube
-          printf '%s' "${{ secrets.KUBECONFIG_DATA }}" > /tmp/kube_raw
-          FIRST_LINE=$(head -1 /tmp/kube_raw)
-          if echo "$FIRST_LINE" | grep -q "^apiVersion"; then
-            echo "[kubectl setup] Secret is raw YAML — using directly"
-            cp /tmp/kube_raw $HOME/.kube/config
-          else
-            echo "[kubectl setup] Secret appears base64-encoded — decoding"
-            base64 --decode /tmp/kube_raw | tr -d '\r' > $HOME/.kube/config
-          fi
-          chmod 600 $HOME/.kube/config
-          rm -f /tmp/kube_raw
-          kubectl config view --minify 2>&1 | head -5
-
-      # ── 5. Deploy to Kyma ────────────────────────────────────────────────
+  # ── Job 2: Deploy to Kyma ────────────────────────────────────────────────────
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
       - name: Deploy to Kyma
         run: |
+          # Write kubeconfig AND run kubectl in the SAME shell
+          mkdir -p $HOME/.kube
+          printf '%s' "${{ secrets.KUBECONFIG_DATA }}" | base64 --decode | tr -d '\r' > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+          export KUBECONFIG=$HOME/.kube/config
+
+          # Verify cluster connection
+          echo "Connecting to: $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+
+          # Deploy new image
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
+          echo "Deploying: $IMAGE"
+
           kubectl set image deployment/ariba-realm-mcp \
-            ariba-realm-mcp=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            ariba-realm-mcp=$IMAGE \
             --namespace=default
+
+          # Wait for rollout
           kubectl rollout status deployment/ariba-realm-mcp \
             --namespace=default \
             --timeout=120s
 
-      # ── 6. Verify ────────────────────────────────────────────────────────
-      - name: Verify health
-        run: |
-          echo "Deployment complete."
           kubectl get pods -l app=ariba-realm-mcp -n default
