@@ -2,7 +2,6 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as http from "http";
-import { randomUUID } from "crypto";
 
 // ── Ariba config ──────────────────────────────────────────────────────────
 const ARIBA = {
@@ -48,7 +47,7 @@ async function aribaGet(apiPath, extra = {}) {
   return r.json();
 }
 
-// ── Parse request body ────────────────────────────────────────────────────
+// ── Parse POST body ───────────────────────────────────────────────────────
 function parseBody(req) {
   return new Promise((resolve) => {
     let data = "";
@@ -60,8 +59,8 @@ function parseBody(req) {
   });
 }
 
-// ── Create a new MCP Server instance (called per session) ─────────────────
-function createMcpServer() {
+// ── Build MCP server with all tool handlers ───────────────────────────────
+function buildServer() {
   const server = new Server(
     { name: "ariba-realm-mcp", version: "1.0.0" },
     { capabilities: { tools: {} } }
@@ -151,24 +150,19 @@ function createMcpServer() {
   return server;
 }
 
-// ── Session store (one transport + server per JWD session) ────────────────
-const sessions = new Map();
-
-// ── HTTP server ───────────────────────────────────────────────────────────
+// ── HTTP server — stateless: fresh transport per request ──────────────────
 const PORT = process.env.PORT || 3000;
 const httpServer = http.createServer();
 
 httpServer.on("request", async (req, res) => {
   console.log(`[REQUEST] ${req.method} ${req.url}`);
 
-  // Response logging
   const origWriteHead = res.writeHead.bind(res);
-  res.writeHead = (statusCode, ...args) => {
-    console.log(`[RESPONSE] ${req.method} ${req.url} → ${statusCode}`);
-    return origWriteHead(statusCode, ...args);
+  res.writeHead = (code, ...args) => {
+    console.log(`[RESPONSE] ${req.method} ${req.url} → ${code}`);
+    return origWriteHead(code, ...args);
   };
 
-  // CORS
   res.setHeader("Access-Control-Allow-Origin",  "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers",
@@ -179,42 +173,12 @@ httpServer.on("request", async (req, res) => {
   if (req.url === "/health")    { res.writeHead(200); res.end("OK"); return; }
 
   if (req.url === "/mcp") {
-    // Parse body for POST
     const body = req.method === "POST" ? await parseBody(req) : undefined;
 
-    const sessionId = req.headers["mcp-session-id"];
-    let transport   = sessions.get(sessionId);
-
-    if (!transport) {
-      // Only initialize requests can create a new session
-      const isInit = body?.method === "initialize";
-      if (!isInit) {
-        console.log(`[SESSION] Rejected — no session for: ${sessionId}`);
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: "No active session. Send initialize first." }));
-        return;
-      }
-
-      // Create fresh transport + server for this session
-      transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (id) => {
-          sessions.set(id, transport);
-          console.log(`[SESSION] Created: ${id}`);
-        },
-      });
-
-      transport.onclose = () => {
-        if (transport.sessionId) {
-          sessions.delete(transport.sessionId);
-          console.log(`[SESSION] Closed: ${transport.sessionId}`);
-        }
-      };
-
-      const server = createMcpServer();
-      await server.connect(transport);
-    }
-
+    // Fresh transport + server for every request — no session state to lose
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const server    = buildServer();
+    await server.connect(transport);
     await transport.handleRequest(req, res, body);
     return;
   }
