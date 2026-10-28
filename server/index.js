@@ -189,16 +189,46 @@ mcp.tool(
 );
 
 // ── HTTP server + health endpoint ─────────────────────────────────────────────
-const transport = new StreamableHTTPServerTransport({ path: "/mcp" });
+const transport = new StreamableHTTPServerTransport({
+  sessionIdGenerator: undefined,   // ← stateless mode — required for Joule
+});
+
 await mcp.connect(transport);
 
-const httpServer = createServer((req, res) => {
+const httpServer = createServer(async (req, res) => {
+
+  // CORS — required for Joule Work Desktop
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204).end();
+    return;
+  }
+
+  // Health check
   if (req.url === "/health" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", realm: ARIBA_REALM, version: "1.1.0" }));
     return;
   }
-  transport.handleRequest(req, res);
+
+  // MCP endpoint — only handle /mcp
+  if (req.url === "/mcp") {
+    try {
+      await transport.handleRequest(req, res);   // ← await was missing before
+    } catch (err) {
+      console.error("[MCP error]", err);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }
+    return;
+  }
+
+  res.writeHead(404).end("Not found");
 });
 
 httpServer.listen(Number(PORT), () => {
