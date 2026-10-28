@@ -1,244 +1,205 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// Ariba Realm MCP Server — v1.1.0
-//
-// What changed from v1.0:
-//   • All three tools now accept createdDateFrom / createdDateTo params.
-//   • Default: last 31 days (production). Override for test realms.
-//     consulting-T has only 2017 data → pass createdDateFrom=2017-01-01T00:00:00Z
-//                                                 createdDateTo=2017-12-31T23:59:59Z
-//   • get_invoices  → fixed view: Invoice_SAP_createdRange
-//   • get_purchase_orders → PurchaseOrder_SAP_createdRange
-//   • get_requisitions    → Requisition_SAP_createdRange
-// ─────────────────────────────────────────────────────────────────────────────
-
-import { McpServer }                     from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { createServer }                  from "node:http";
-import { z }                             from "zod";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import * as http from "http";
 
-// ── Environment ────────────────────────────────────────────────────────────────
-const {
-  ARIBA_BASE_URL    = "https://openapi.ariba.com",
-  ARIBA_TOKEN_URL,
-  ARIBA_CLIENT_ID,
-  ARIBA_CLIENT_SECRET,
-  ARIBA_API_KEY,
-  ARIBA_REALM,
-  PORT = "3000",
-} = process.env;
-
-// ── OAuth 2.0 token cache ──────────────────────────────────────────────────────
-let _cachedToken    = null;
-let _tokenExpiresAt = 0;
-
-async function getAccessToken() {
-  if (_cachedToken && Date.now() < _tokenExpiresAt - 30_000) return _cachedToken;
-
-  const body = new URLSearchParams({
-    grant_type:    "client_credentials",
-    client_id:     ARIBA_CLIENT_ID,
-    client_secret: ARIBA_CLIENT_SECRET,
-  });
-
-  const res = await fetch(ARIBA_TOKEN_URL, {
-    method:  "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-
-  if (!res.ok) throw new Error(`Token failed ${res.status}: ${await res.text()}`);
-
-  const data      = await res.json();
-  _cachedToken    = data.access_token;
-  _tokenExpiresAt = Date.now() + (data.expires_in ?? 3600) * 1000;
-  return _cachedToken;
-}
-
-// ── Ariba Operational Reporting helper ────────────────────────────────────────
-//  GET /api/procurement-reporting/v2/prod/views/{view}?realm=X&filters=k=v;k=v
-async function queryView(viewName, filters = {}) {
-  const token     = await getAccessToken();
-  const filterStr = Object.entries(filters)
-    .filter(([, v]) => v != null && v !== "")
-    .map(([k, v]) => `${k}=${v}`)
-    .join(";");
-
-  const qs = new URLSearchParams({ realm: ARIBA_REALM });
-  if (filterStr) qs.set("filters", filterStr);
-
-  const url = `${ARIBA_BASE_URL}/api/procurement-reporting/v2/prod/views/${viewName}?${qs}`;
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      apiKey:        ARIBA_API_KEY,
-      Accept:        "application/json",
-    },
-  });
-
-  if (!res.ok)
-    throw new Error(`Ariba API ${res.status} (view: ${viewName}): ${await res.text()}`);
-
-  return res.json();
-}
-
-// ── Date range helper ─────────────────────────────────────────────────────────
-// SAP Ariba sync API restriction: window must be ≤ 31 days.
-function defaultDateRange(days = 31) {
-  const to   = new Date();
-  const from = new Date(Date.now() - days * 86_400_000);
-  const fmt  = (d) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
-  return { from: fmt(from), to: fmt(to) };
-}
-
-// ── Shared date params schema ──────────────────────────────────────────────────
-const dateParams = {
-  createdDateFrom: z.string().optional().describe(
-    "ISO 8601 start e.g. 2017-01-01T00:00:00Z  (default: 31 days ago)"
-  ),
-  createdDateTo: z.string().optional().describe(
-    "ISO 8601 end   e.g. 2017-12-31T23:59:59Z  (default: now, window ≤ 31 days)"
-  ),
+// ── Ariba config ──────────────────────────────────────────────────────────
+const ARIBA = {
+  baseUrl:      process.env.ARIBA_BASE_URL      || "https://openapi.ariba.com",
+  tokenUrl:     process.env.ARIBA_TOKEN_URL     || "https://api.ariba.com/v2/oauth/token",
+  clientId:     process.env.ARIBA_CLIENT_ID     || "",
+  clientSecret: process.env.ARIBA_CLIENT_SECRET || "",
+  apiKey:       process.env.ARIBA_API_KEY       || "",
+  realm:        process.env.ARIBA_REALM         || "",
 };
+const ready = !!(ARIBA.clientId && ARIBA.clientSecret && ARIBA.apiKey && ARIBA.realm);
 
-// ── MCP Server ─────────────────────────────────────────────────────────────────
-const mcp = new McpServer({ name: "ariba-realm-mcp", version: "1.1.0" });
+// Test realms end with -T → sandbox; production realms → prod
+const ENV = ARIBA.realm.endsWith("-T") ? "sandbox" : "prod";
 
-// ─── get_requisitions ─────────────────────────────────────────────────────────
-mcp.tool(
-  "get_requisitions",
-  "Fetch purchase requisitions from the SAP Ariba realm.",
-  {
-    requesterId: z.string().optional().describe("Ariba user ID of the requester"),
-    status:      z.enum(["Approved","Denied","Composing","Submitted","Ordering"]).optional(),
-    top:         z.number().optional().describe("Max records (default 20)"),
-    ...dateParams,
-  },
-  async ({ requesterId, status, createdDateFrom, createdDateTo, top = 20 }) => {
-    const range   = defaultDateRange(31);
-    const filters = {
-      createdDateFrom: createdDateFrom ?? range.from,
-      createdDateTo:   createdDateTo   ?? range.to,
-    };
-    if (status)      filters.status      = status;
-    if (requesterId) filters.requesterId = requesterId;
-
-    const data = await queryView("Requisition_SAP_createdRange", filters);
-    return {
-      content: [{
-        type: "text",
-        text: JSON.stringify({ Records: (data.Records ?? []).slice(0, top) }, null, 2),
-      }],
-    };
-  }
+console.log(ready
+  ? `[Ariba MCP] Ready — realm: ${ARIBA.realm} | env: ${ENV}`
+  : "[Ariba MCP] WARNING: credentials not set — set env vars before testing"
 );
 
-// ─── get_purchase_orders ──────────────────────────────────────────────────────
-mcp.tool(
-  "get_purchase_orders",
-  "Fetch purchase orders from the SAP Ariba realm.",
-  {
-    supplierName: z.string().optional().describe("Partial supplier name"),
-    status:       z.enum(["Ordered","Received","Cancelled","Invoiced"]).optional(),
-    top:          z.number().optional().describe("Max records (default 20)"),
-    ...dateParams,
-  },
-  async ({ supplierName, status, createdDateFrom, createdDateTo, top = 20 }) => {
-    const range   = defaultDateRange(31);
-    const filters = {
-      createdDateFrom: createdDateFrom ?? range.from,
-      createdDateTo:   createdDateTo   ?? range.to,
-    };
-    if (status)       filters.status       = status;
-    if (supplierName) filters.supplierName = supplierName;
+// ── Token cache ───────────────────────────────────────────────────────────
+let _token = "", _exp = 0;
+async function getToken() {
+  if (_token && Date.now() < _exp - 60_000) return _token;
+  const creds = Buffer.from(`${ARIBA.clientId}:${ARIBA.clientSecret}`).toString("base64");
+  const r = await fetch(ARIBA.tokenUrl, {
+    method: "POST",
+    headers: { "Authorization": `Basic ${creds}`, "Content-Type": "application/x-www-form-urlencoded" },
+    body: "grant_type=client_credentials",
+  });
+  if (!r.ok) throw new Error(`Token request failed (${r.status}): ${await r.text()}`);
+  const d = await r.json();
+  _token = d.access_token;
+  _exp   = Date.now() + (d.expires_in || 3600) * 1000;
+  return _token;
+}
 
-    const data = await queryView("PurchaseOrder_SAP_createdRange", filters);
-    return {
-      content: [{
-        type: "text",
-        text: JSON.stringify({ Records: (data.Records ?? []).slice(0, top) }, null, 2),
-      }],
-    };
-  }
-);
+// ── Ariba GET helper ──────────────────────────────────────────────────────
+async function aribaGet(apiPath, queryParams = {}) {
+  if (!ready) throw new Error("Ariba credentials not configured.");
+  const token  = await getToken();
+  const params = new URLSearchParams({ realm: ARIBA.realm, ...queryParams });
+  const url    = `${ARIBA.baseUrl}${apiPath}?${params}`;
+  console.log(`[Ariba] GET ${url}`);
+  const r = await fetch(url, {
+    headers: { "Authorization": `Bearer ${token}`, "apiKey": ARIBA.apiKey, "Accept": "application/json" },
+  });
+  if (!r.ok) throw new Error(`Ariba API error (${r.status}): ${await r.text()}`);
+  return r.json();
+}
 
-// ─── get_invoices ─────────────────────────────────────────────────────────────
-mcp.tool(
-  "get_invoices",
-  "Fetch invoices from the SAP Ariba realm.",
-  {
-    status: z.enum(["Reconciled","Rejected","Paying","Paid","Approving"]).optional(),
-    top:    z.number().optional().describe("Max records (default 20)"),
-    ...dateParams,
-  },
-  async ({ status, createdDateFrom, createdDateTo, top = 20 }) => {
-    const range   = defaultDateRange(31);
-    const filters = {
-      createdDateFrom: createdDateFrom ?? range.from,
-      createdDateTo:   createdDateTo   ?? range.to,
-    };
-    if (status) filters.status = status;
+// ── Parse POST body ───────────────────────────────────────────────────────
+function parseBody(req) {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", chunk => { data += chunk; });
+    req.on("end", () => {
+      try { resolve(JSON.parse(data)); }
+      catch { resolve(undefined); }
+    });
+  });
+}
 
-    const data = await queryView("Invoice_SAP_createdRange", filters);
-    return {
-      content: [{
-        type: "text",
-        text: JSON.stringify({ Records: (data.Records ?? []).slice(0, top) }, null, 2),
-      }],
-    };
-  }
-);
+// ── Build MCP server ──────────────────────────────────────────────────────
+function buildServer() {
+  const server = new Server(
+    { name: "ariba-realm-mcp", version: "1.0.0" },
+    { capabilities: { tools: {} } }
+  );
 
-// ── HTTP server + health endpoint ─────────────────────────────────────────────
-const transport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: undefined,          // stateless mode
-});
-await mcp.connect(transport);
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: "get_requisitions",
+        description: "Fetch purchase requisitions from the SAP Ariba realm.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            status:      { type: "string", description: "Approved | Denied | Composing | Submitted | Ordering" },
+            requesterId: { type: "string", description: "Ariba user ID of the requester" },
+            top:         { type: "number", description: "Max records (default 20)" },
+          },
+        },
+      },
+      {
+        name: "get_purchase_orders",
+        description: "Fetch purchase orders from the SAP Ariba realm.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            status:       { type: "string", description: "Ordered | Received | Cancelled | Invoiced" },
+            supplierName: { type: "string", description: "Partial supplier name" },
+            top:          { type: "number", description: "Max records (default 20)" },
+          },
+        },
+      },
+      {
+        name: "get_invoices",
+        description: "Fetch invoices from the SAP Ariba realm.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            status: { type: "string", description: "Reconciled | Rejected | Paying | Paid | Approving" },
+            top:    { type: "number", description: "Max records (default 20)" },
+          },
+        },
+      },
+    ],
+  }));
 
-const httpServer = createServer(async (req, res) => {
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    const { name, arguments: a } = req.params;
+    const top = Math.min(Number(a?.top || 20), 100).toString();
 
-  // CORS — required for Joule Work Desktop
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, mcp-session-id");
-  if (req.method === "OPTIONS") { res.writeHead(204).end(); return; }
-
-  // Health
-  if (req.url === "/health" && req.method === "GET") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", realm: ARIBA_REALM, version: "1.1.0" }));
-    return;
-  }
-
-  // MCP
-  if (req.url === "/mcp") {
     try {
-      // Pre-read body so the transport receives it already parsed
-      let parsedBody;
-      if (req.method === "POST") {
-        const raw = await new Promise((resolve, reject) => {
-          const chunks = [];
-          req.on("data", c => chunks.push(c));
-          req.on("end",  () => resolve(Buffer.concat(chunks).toString()));
-          req.on("error", reject);
-        });
-        if (raw) parsedBody = JSON.parse(raw);
+      // ── get_requisitions ──────────────────────────────────────────────
+      if (name === "get_requisitions") {
+        const filters = {};
+        if (a?.status)      filters.Status      = [a.status];
+        if (a?.requesterId) filters.RequesterId = [a.requesterId];
+        const params = { $top: top };
+        if (Object.keys(filters).length) params.filters = JSON.stringify(filters);
+        const data = await aribaGet(
+          `/api/procurement-reporting-details/v2/${ENV}/views/RequisitionLineItemFact`,
+          params
+        );
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
-      await transport.handleRequest(req, res, parsedBody);   // ← await + parsed body
+
+      // ── get_purchase_orders ───────────────────────────────────────────
+      if (name === "get_purchase_orders") {
+        const filters = {};
+        if (a?.status)       filters.Status       = [a.status];
+        if (a?.supplierName) filters.SupplierName = [a.supplierName];
+        const params = { $top: top };
+        if (Object.keys(filters).length) params.filters = JSON.stringify(filters);
+        const data = await aribaGet(
+          `/api/procurement-reporting-details/v2/${ENV}/views/PurchaseOrderLineItemFact`,
+          params
+        );
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      // ── get_invoices ──────────────────────────────────────────────────
+      if (name === "get_invoices") {
+        const filters = {};
+        if (a?.status) filters.Status = [a.status];
+        const params = { $top: top };
+        if (Object.keys(filters).length) params.filters = JSON.stringify(filters);
+        const data = await aribaGet(
+          `/api/procurement-reporting-details/v2/${ENV}/views/InvoiceLineItemFact`,
+          params
+        );
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      throw new Error(`Unknown tool: ${name}`);
     } catch (err) {
-      console.error("[MCP error]", err.stack ?? err.message);
-      if (!res.headersSent) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
-      }
+      return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
     }
+  });
+
+  return server;
+}
+
+// ── HTTP server — stateless: fresh transport per request ──────────────────
+const PORT = process.env.PORT || 3000;
+const httpServer = http.createServer();
+
+httpServer.on("request", async (req, res) => {
+  console.log(`[REQUEST] ${req.method} ${req.url}`);
+
+  const origWriteHead = res.writeHead.bind(res);
+  res.writeHead = (code, ...args) => {
+    console.log(`[RESPONSE] ${req.method} ${req.url} → ${code}`);
+    return origWriteHead(code, ...args);
+  };
+
+  res.setHeader("Access-Control-Allow-Origin",  "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers",
+    "Content-Type, Authorization, mcp-session-id, Mcp-Session-Id, Accept");
+  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id, mcp-session-id");
+
+  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+  if (req.url === "/health")    { res.writeHead(200); res.end("OK"); return; }
+
+  if (req.url === "/mcp") {
+    const body      = req.method === "POST" ? await parseBody(req) : undefined;
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const server    = buildServer();
+    await server.connect(transport);
+    await transport.handleRequest(req, res, body);
     return;
   }
 
-  res.writeHead(404).end("Not found");
+  res.writeHead(404);
+  res.end("Not Found");
 });
 
-httpServer.listen(Number(PORT), () => {
-  console.log(`[ariba-realm-mcp v1.1.0] Port ${PORT}`);
-  console.log(`Realm : ${ARIBA_REALM}`);
-  console.log(`Views : Requisition_SAP_createdRange | PurchaseOrder_SAP_createdRange | Invoice_SAP_createdRange`);
-});
+httpServer.listen(PORT, () => console.log(`[Ariba MCP] Listening on :${PORT}/mcp`));
