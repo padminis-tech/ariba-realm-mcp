@@ -190,9 +190,8 @@ mcp.tool(
 
 // ── HTTP server + health endpoint ─────────────────────────────────────────────
 const transport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: undefined,   // ← stateless mode — required for Joule
+  sessionIdGenerator: undefined,          // stateless mode
 });
-
 await mcp.connect(transport);
 
 const httpServer = createServer(async (req, res) => {
@@ -200,26 +199,33 @@ const httpServer = createServer(async (req, res) => {
   // CORS — required for Joule Work Desktop
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, mcp-session-id");
+  if (req.method === "OPTIONS") { res.writeHead(204).end(); return; }
 
-  if (req.method === "OPTIONS") {
-    res.writeHead(204).end();
-    return;
-  }
-
-  // Health check
+  // Health
   if (req.url === "/health" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", realm: ARIBA_REALM, version: "1.1.0" }));
     return;
   }
 
-  // MCP endpoint — only handle /mcp
+  // MCP
   if (req.url === "/mcp") {
     try {
-      await transport.handleRequest(req, res);   // ← await was missing before
+      // Pre-read body so the transport receives it already parsed
+      let parsedBody;
+      if (req.method === "POST") {
+        const raw = await new Promise((resolve, reject) => {
+          const chunks = [];
+          req.on("data", c => chunks.push(c));
+          req.on("end",  () => resolve(Buffer.concat(chunks).toString()));
+          req.on("error", reject);
+        });
+        if (raw) parsedBody = JSON.parse(raw);
+      }
+      await transport.handleRequest(req, res, parsedBody);   // ← await + parsed body
     } catch (err) {
-      console.error("[MCP error]", err);
+      console.error("[MCP error]", err.stack ?? err.message);
       if (!res.headersSent) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
