@@ -13,13 +13,11 @@ const ARIBA = {
   realm:        process.env.ARIBA_REALM         || "",
 };
 const ready = !!(ARIBA.clientId && ARIBA.clientSecret && ARIBA.apiKey && ARIBA.realm);
-
-// Test realms end with -T → sandbox; production realms → prod
-const ENV = ARIBA.realm.endsWith("-T") ? "sandbox" : "prod";
+const ENV   = ARIBA.realm.endsWith("-T") ? "sandbox" : "prod";
 
 console.log(ready
   ? `[Ariba MCP] Ready — realm: ${ARIBA.realm} | env: ${ENV}`
-  : "[Ariba MCP] WARNING: credentials not set — set env vars before testing"
+  : "[Ariba MCP] WARNING: credentials not set"
 );
 
 // ── Token cache ───────────────────────────────────────────────────────────
@@ -53,6 +51,15 @@ async function aribaGet(apiPath, queryParams = {}) {
   return r.json();
 }
 
+// ── Default date range (last 31 days) ─────────────────────────────────────
+function defaultDateRange() {
+  const fmt = (d) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
+  return {
+    from: fmt(new Date(Date.now() - 31 * 86_400_000)),
+    to:   fmt(new Date()),
+  };
+}
+
 // ── Parse POST body ───────────────────────────────────────────────────────
 function parseBody(req) {
   return new Promise((resolve) => {
@@ -68,7 +75,7 @@ function parseBody(req) {
 // ── Build MCP server ──────────────────────────────────────────────────────
 function buildServer() {
   const server = new Server(
-    { name: "ariba-realm-mcp", version: "1.0.0" },
+    { name: "ariba-realm-mcp", version: "1.1.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -80,9 +87,11 @@ function buildServer() {
         inputSchema: {
           type: "object",
           properties: {
-            status:      { type: "string", description: "Approved | Denied | Composing | Submitted | Ordering" },
-            requesterId: { type: "string", description: "Ariba user ID of the requester" },
-            top:         { type: "number", description: "Max records (default 20)" },
+            status:          { type: "string", description: "Approved | Denied | Composing | Submitted | Ordering" },
+            requesterId:     { type: "string", description: "Ariba user ID of the requester" },
+            top:             { type: "number", description: "Max records (default 20)" },
+            createdDateFrom: { type: "string", description: "ISO 8601 start e.g. 2017-01-01T00:00:00Z (default: 31 days ago)" },
+            createdDateTo:   { type: "string", description: "ISO 8601 end e.g. 2017-12-31T23:59:59Z (default: now)" },
           },
         },
       },
@@ -92,9 +101,11 @@ function buildServer() {
         inputSchema: {
           type: "object",
           properties: {
-            status:       { type: "string", description: "Ordered | Received | Cancelled | Invoiced" },
-            supplierName: { type: "string", description: "Partial supplier name" },
-            top:          { type: "number", description: "Max records (default 20)" },
+            status:          { type: "string", description: "Ordered | Received | Cancelled | Invoiced" },
+            supplierName:    { type: "string", description: "Partial supplier name" },
+            top:             { type: "number", description: "Max records (default 20)" },
+            createdDateFrom: { type: "string", description: "ISO 8601 start e.g. 2017-01-01T00:00:00Z (default: 31 days ago)" },
+            createdDateTo:   { type: "string", description: "ISO 8601 end e.g. 2017-12-31T23:59:59Z (default: now)" },
           },
         },
       },
@@ -104,8 +115,10 @@ function buildServer() {
         inputSchema: {
           type: "object",
           properties: {
-            status: { type: "string", description: "Reconciled | Rejected | Paying | Paid | Approving" },
-            top:    { type: "number", description: "Max records (default 20)" },
+            status:          { type: "string", description: "Reconciled | Rejected | Paying | Paid | Approving" },
+            top:             { type: "number", description: "Max records (default 20)" },
+            createdDateFrom: { type: "string", description: "ISO 8601 start e.g. 2017-01-01T00:00:00Z (default: 31 days ago)" },
+            createdDateTo:   { type: "string", description: "ISO 8601 end e.g. 2017-12-31T23:59:59Z (default: now)" },
           },
         },
       },
@@ -114,46 +127,43 @@ function buildServer() {
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const { name, arguments: a } = req.params;
-    const top = Math.min(Number(a?.top || 20), 100).toString();
+    const top   = Math.min(Number(a?.top || 20), 100).toString();
+    const range = defaultDateRange();
+    const dateFrom = a?.createdDateFrom ?? range.from;
+    const dateTo   = a?.createdDateTo   ?? range.to;
 
     try {
       // ── get_requisitions ──────────────────────────────────────────────
       if (name === "get_requisitions") {
-        const filters = {};
+        const filters = { CreateDate: [{ from: dateFrom, to: dateTo }] };
         if (a?.status)      filters.Status      = [a.status];
         if (a?.requesterId) filters.RequesterId = [a.requesterId];
-        const params = { $top: top };
-        if (Object.keys(filters).length) params.filters = JSON.stringify(filters);
         const data = await aribaGet(
           `/api/procurement-reporting-details/v2/${ENV}/views/RequisitionLineItemFact`,
-          params
+          { $top: top, filters: JSON.stringify(filters) }
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
 
       // ── get_purchase_orders ───────────────────────────────────────────
       if (name === "get_purchase_orders") {
-        const filters = {};
+        const filters = { CreateDate: [{ from: dateFrom, to: dateTo }] };
         if (a?.status)       filters.Status       = [a.status];
         if (a?.supplierName) filters.SupplierName = [a.supplierName];
-        const params = { $top: top };
-        if (Object.keys(filters).length) params.filters = JSON.stringify(filters);
         const data = await aribaGet(
           `/api/procurement-reporting-details/v2/${ENV}/views/PurchaseOrderLineItemFact`,
-          params
+          { $top: top, filters: JSON.stringify(filters) }
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
 
       // ── get_invoices ──────────────────────────────────────────────────
       if (name === "get_invoices") {
-        const filters = {};
+        const filters = { CreateDate: [{ from: dateFrom, to: dateTo }] };
         if (a?.status) filters.Status = [a.status];
-        const params = { $top: top };
-        if (Object.keys(filters).length) params.filters = JSON.stringify(filters);
         const data = await aribaGet(
           `/api/procurement-reporting-details/v2/${ENV}/views/InvoiceLineItemFact`,
-          params
+          { $top: top, filters: JSON.stringify(filters) }
         );
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
@@ -174,12 +184,6 @@ const httpServer = http.createServer();
 httpServer.on("request", async (req, res) => {
   console.log(`[REQUEST] ${req.method} ${req.url}`);
 
-  const origWriteHead = res.writeHead.bind(res);
-  res.writeHead = (code, ...args) => {
-    console.log(`[RESPONSE] ${req.method} ${req.url} → ${code}`);
-    return origWriteHead(code, ...args);
-  };
-
   res.setHeader("Access-Control-Allow-Origin",  "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers",
@@ -187,7 +191,7 @@ httpServer.on("request", async (req, res) => {
   res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id, mcp-session-id");
 
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
-  if (req.url === "/health")    { res.writeHead(200); res.end("OK"); return; }
+  if (req.url === "/health")    { res.writeHead(200); res.end(JSON.stringify({ status: "ok", version: "1.1.0" })); return; }
 
   if (req.url === "/mcp") {
     const body      = req.method === "POST" ? await parseBody(req) : undefined;
@@ -202,4 +206,4 @@ httpServer.on("request", async (req, res) => {
   res.end("Not Found");
 });
 
-httpServer.listen(PORT, () => console.log(`[Ariba MCP] Listening on :${PORT}/mcp`));
+httpServer.listen(PORT, () => console.log(`[Ariba MCP v1.1.0] Listening on :${PORT}/mcp`));
